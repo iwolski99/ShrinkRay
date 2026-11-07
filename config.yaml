@@ -1,0 +1,24 @@
+# ShrinkRay build settings
+# Edit these on GitHub, commit, and a new APK is built automatically.
+# Photo/video/compression values are just the starting defaults: you can
+# change them later inside the app (gear icon) without rebuilding.
+
+app_name: ShrinkRay
+app_id: com.shrinkray.app      # must be unique on your phone; letters, numbers, dots
+version_name: "1.0"
+version_code: auto             # "auto" = goes up by 1 every build, so updates install cleanly
+
+photos:
+  quality: 88                  # 60-95. 85-90 is visually identical for normal viewing
+  max_long_side: 4000          # pixels. 4000 = 12 MP. Use 0 to keep the original resolution
+  min_size_mb: 1.5             # ignore photos smaller than this
+
+videos:
+  codec: hevc                  # hevc (smaller files) or h264 (plays on anything)
+  quality: balanced            # lower | balanced | higher
+  min_size_mb: 10              # ignore videos smaller than this
+
+audio:
+  min_size_mb: 2               # wav/flac always qualify; mp3/m4a only above ~200 kbps
+
+min_savings_percent: 15        # only replace a file if the new one is at least this much smaller
