@@ -1,0 +1,207 @@
+# Builds the Android app from the .zip + config.yaml in this repo.
+# Runs automatically whenever you upload a new zip or edit config.yaml,
+# or manually from the Actions tab ("Run workflow").
+# The finished APK appears under Releases (and as a run artifact).
+
+name: Build app
+
+on:
+  push:
+    paths:
+      - "**.zip"
+      - "config.yaml"
+      - "config.yml"
+      - "config.YAML"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-app
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Get repo files
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unzip source and read config.yaml
+        run: |
+          set -euo pipefail
+
+          # 1. Find the uploaded zip (newest commit wins if there are several)
+          ZIP=$(git ls-files -z -- '*.zip' '*.ZIP' | while IFS= read -r -d '' f; do
+                  echo "$(git log -1 --format=%ct -- "$f") $f"; done | sort -rn | head -n1 | cut -d' ' -f2-)
+          if [ -z "$ZIP" ]; then
+            echo "::error::No .zip file found in the repo. Upload your app source zip first."
+            exit 1
+          fi
+          echo "Using source zip: $ZIP"
+          rm -rf build-src && mkdir build-src
+          unzip -q -o "$ZIP" -d build-src
+
+          SETTINGS=$(find build-src -name settings.gradle.kts -not -path '*/build/*' | head -n1)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Couldn't find settings.gradle.kts inside $ZIP. Is it the right zip?"
+            exit 1
+          fi
+          ROOT=$(dirname "$SETTINGS")
+
+          # 2. Find config.yaml (repo root first, then inside the zip)
+          CONFIG=""
+          for c in config.yaml config.yml config.YAML config.YML Config.yaml; do
+            if [ -f "$c" ]; then CONFIG="$c"; break; fi
+          done
+          if [ -z "$CONFIG" ]; then
+            CONFIG=$(find "$ROOT" -maxdepth 1 -iname 'config.y*ml' | head -n1 || true)
+          fi
+          if [ -z "$CONFIG" ]; then
+            echo "::warning::No config.yaml found, using default settings."
+            CONFIG="$RUNNER_TEMP/empty.yaml"
+            echo '{}' > "$CONFIG"
+          fi
+          echo "Using config: $CONFIG"
+          yq -e '.' "$CONFIG" > /dev/null || { echo "::error::$CONFIG isn't valid YAML. Check the indentation."; exit 1; }
+
+          get() { yq -r "($1) // \"$2\"" "$CONFIG"; }
+          num() {
+            local v; v=$(get "$1" "$2")
+            if ! [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::$1 in config.yaml must be a number (got '$v')" >&2; exit 1
+            fi
+            echo "$v"
+          }
+
+          APP_NAME=$(get '.app_name' 'ShrinkRay')
+          APP_ID=$(get '.app_id' 'com.shrinkray.app')
+          VERSION_NAME=$(get '.version_name' '1.0')
+          VERSION_CODE=$(get '.version_code' 'auto')
+          [ "$VERSION_CODE" = "auto" ] && VERSION_CODE="$GITHUB_RUN_NUMBER"
+          if ! [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::version_code must be a whole number or 'auto'"; exit 1
+          fi
+          if ! [[ "$APP_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "::error::app_id '$APP_ID' is invalid. Use something like com.yourname.shrinkray"; exit 1
+          fi
+
+          JPEG_QUALITY=$(num '.photos.quality' 88)
+          MAX_SIDE=$(num '.photos.max_long_side' 4000)
+          PHOTO_MIN=$(num '.photos.min_size_mb' 1.5)
+          VIDEO_MIN=$(num '.videos.min_size_mb' 10)
+          AUDIO_MIN=$(num '.audio.min_size_mb' 2)
+          MIN_SAVE=$(num '.min_savings_percent' 15)
+          VIDEO_CODEC=$(get '.videos.codec' 'hevc' | tr '[:upper:]' '[:lower:]')
+          VIDEO_QUALITY=$(get '.videos.quality' 'balanced' | tr '[:upper:]' '[:lower:]')
+          case "$VIDEO_CODEC" in hevc|h265) VIDEO_CODEC=hevc;; h264|avc) VIDEO_CODEC=h264;;
+            *) echo "::error::videos.codec must be hevc or h264"; exit 1;; esac
+          case "$VIDEO_QUALITY" in lower|balanced|higher) ;;
+            *) echo "::error::videos.quality must be lower, balanced or higher"; exit 1;; esac
+          # Whole numbers only for these
+          JPEG_QUALITY=${JPEG_QUALITY%%.*}; MAX_SIDE=${MAX_SIDE%%.*}; MIN_SAVE=${MIN_SAVE%%.*}
+
+          SAFE_NAME=$(echo "$APP_NAME" | tr -c 'A-Za-z0-9._-' '_' | sed 's/_*$//')
+          {
+            echo "PROJECT_ROOT=$ROOT"
+            echo "APP_NAME=$APP_NAME"
+            echo "SAFE_NAME=$SAFE_NAME"
+            echo "APP_ID=$APP_ID"
+            echo "VERSION_NAME=$VERSION_NAME"
+            echo "VERSION_CODE=$VERSION_CODE"
+            echo "JPEG_QUALITY=$JPEG_QUALITY"
+            echo "MAX_SIDE=$MAX_SIDE"
+            echo "PHOTO_MIN=$PHOTO_MIN"
+            echo "VIDEO_MIN=$VIDEO_MIN"
+            echo "AUDIO_MIN=$AUDIO_MIN"
+            echo "MIN_SAVE=$MIN_SAVE"
+            echo "VIDEO_CODEC=$VIDEO_CODEC"
+            echo "VIDEO_QUALITY=$VIDEO_QUALITY"
+          } >> "$GITHUB_ENV"
+
+          echo "### Building $APP_NAME $VERSION_NAME (code $VERSION_CODE)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            PASS="$KEYSTORE_PASSWORD"
+            ALIAS="${KEY_ALIAS:-release}"
+            echo "Signing with your saved key (updates install over the old app)."
+          else
+            PASS=$(openssl rand -hex 16)
+            ALIAS=release
+            keytool -genkeypair -keystore "$KS" -storetype PKCS12 -storepass "$PASS" -keypass "$PASS" \
+              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=ShrinkRay" -noprompt
+            echo "::notice::Signed with a one-time key. To install a newer build, uninstall the old app first (or set up a saved key, see README)."
+          fi
+          echo "::add-mask::$PASS"
+          {
+            echo "KS_PATH=$KS"
+            echo "KS_PASS=$PASS"
+            echo "KS_ALIAS=$ALIAS"
+            echo "KEY_PASS=$PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build APK
+        run: |
+          set -euo pipefail
+          gradle -p "$PROJECT_ROOT" assembleRelease --no-daemon --stacktrace \
+            "-PappName=$APP_NAME" \
+            "-PappId=$APP_ID" \
+            "-PversionName=$VERSION_NAME" \
+            "-PversionCode=$VERSION_CODE" \
+            "-PjpegQuality=$JPEG_QUALITY" \
+            "-PmaxLongSide=$MAX_SIDE" \
+            "-PphotoMinMb=$PHOTO_MIN" \
+            "-PvideoMinMb=$VIDEO_MIN" \
+            "-PaudioMinMb=$AUDIO_MIN" \
+            "-PminSavingsPercent=$MIN_SAVE" \
+            "-PvideoCodec=$VIDEO_CODEC" \
+            "-PvideoQuality=$VIDEO_QUALITY"
+          mkdir -p dist
+          APK="dist/${SAFE_NAME}-${VERSION_NAME}-build${GITHUB_RUN_NUMBER}.apk"
+          cp "$PROJECT_ROOT/app/build/outputs/apk/release/app-release.apk" "$APK"
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "APK size: $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save APK as run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}-apk
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+
+      - name: Publish release (download the APK from here on your phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION_NAME}-build${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" "$APK_PATH" \
+            --target "$GITHUB_SHA" \
+            --title "$APP_NAME $VERSION_NAME (build $GITHUB_RUN_NUMBER)" \
+            --notes "Tap the .apk below to download, then open it to install. You may need to allow installs from your browser or Files app."
+          echo "Release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
